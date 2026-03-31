@@ -50,6 +50,9 @@ def compute_objective_function(confidence_metrics_dict: dict, objective_function
     if objective_function == 'ligand_plddt':
         return confidence_metrics_dict['design_ligand_plddt']
 
+    elif objective_function == 'ligand_plddt_and_iptm':
+        return confidence_metrics_dict['design_ligand_plddt'] + confidence_metrics_dict['iptm']
+
     elif objective_function == 'iptm':
         return confidence_metrics_dict['iptm']
 
@@ -148,7 +151,7 @@ class DesignCampaign:
         use_reduce_protonation, keep_input_backbone_in_queue, keep_best_generator_backbone, use_boltz_conformer_potentials,
         boltz2_predict_affinity, drop_rmsd_mask_atoms_from_ligand_plddt_calc, use_boltz_1x, 
         boltz2_disable_kernels, boltz2_disable_nccl_p2p, objective_function, fixed_identity_residue_indices, 
-        align_on_binding_site, burial_mask_alpha_hull_alpha, **kwargs
+        align_on_binding_site, burial_mask_alpha_hull_alpha, boltz2_cache_directory, boltz2_sampling_steps, **kwargs
     ):
         self.debug = debug
         self.ligand_3lc = ligand_3lc
@@ -158,6 +161,8 @@ class DesignCampaign:
         self.boltz2x_executable_path = boltz2x_executable_path
         self.predict_affinity = boltz2_predict_affinity
         self.use_reduce_protonation = use_reduce_protonation
+        self.boltz2_cache_directory = boltz2_cache_directory
+        self.boltz2_sampling_steps = boltz2_sampling_steps
         self.boltz2_disable_kernels = boltz2_disable_kernels
         self.boltz2_disable_nccl_p2p = boltz2_disable_nccl_p2p 
         self.objective_function = objective_function
@@ -427,10 +432,10 @@ class DesignCampaign:
 
 def predict_complex_structures(
     boltz_inputs_dir, boltz2x_executable_path, boltz_inference_devices, 
-    boltz_output_dir, use_potentials, use_boltz_1x, disable_kernels, disable_nccl_p2p, debug
+    boltz_output_dir, use_potentials, use_boltz_1x, disable_kernels, disable_nccl_p2p, boltz2_cache_directory, boltz2_sampling_steps, debug
 ):
     device_ints = [x.split(':')[-1] for x in boltz_inference_devices]
-    command = f'{boltz2x_executable_path} predict {boltz_inputs_dir} --devices {len(device_ints)} --out_dir {boltz_output_dir} --output_format pdb --override'
+    command = f'{boltz2x_executable_path} predict {boltz_inputs_dir} --devices {len(device_ints)} --out_dir {boltz_output_dir} --output_format pdb --override --sampling_steps {int(boltz2_sampling_steps)} --sampling_steps_affinity {int(boltz2_sampling_steps)}'
     command = f'CUDA_VISIBLE_DEVICES={",".join(device_ints)} {command}'
 
     if disable_nccl_p2p:
@@ -444,6 +449,9 @@ def predict_complex_structures(
 
     if disable_kernels:
         command += f' --no_kernels'
+
+    if boltz2_cache_directory is not None:
+        command += f' --cache {boltz2_cache_directory}'
 
     print(command)
 
@@ -514,7 +522,7 @@ def main(use_wandb, reduce_executable_path, reduce_hetdict_path, **kwargs):
             predict_complex_structures(
                 boltz_input_dir, design_campaign.boltz2x_executable_path, design_campaign.boltz_inference_devices, 
                 sampling_subdir, design_campaign.use_boltz_conformer_potentials, design_campaign.use_boltz_1x, 
-                design_campaign.boltz2_disable_kernels, design_campaign.boltz2_disable_nccl_p2p, design_campaign.debug
+                design_campaign.boltz2_disable_kernels, design_campaign.boltz2_disable_nccl_p2p, design_campaign.boltz2_cache_directory, design_campaign.boltz2_sampling_steps, design_campaign.debug
             )
             curr_tries += 1
 
@@ -551,10 +559,16 @@ if __name__ == "__main__":
         'chi_temp': 1e-6, 'seq_min_p': 0.0, 'chi_min_p': 0.0,
         'disable_pbar': True, 'disabled_residues_list': ['X', 'C'], # Disables cysteine sampling by default.
         # ==================================================================================================== 
-        # Optional: Pass a prody selection string of the form ('resnum 1 or resnum 3 or resnum 5...') to 
-        # specify residues over which to constrain the sampling of ALA or GLY residues. 
-        # This string can be generated using './identify_surface_residues.ipynb'
+        # If constrain_ala_gly_sampling_to_exposed_non_secondary_structure is True (recommended), 
+        # the ala_budget and gly_budget parameters are 
+        # used to constrain the sampling of ALA and GLY residues to exposed non-secondary structured residues.
+        # You can override the specific residues with the budget_residue_sele_string parameter (not recommended).
+        # If constrain_ala_gly_sampling_to_exposed_non_secondary_structure is False and budget_residue_sele_string is None,
+        # no constraints are applied to the sampling of ALA and GLY residues.
+        # The reason we suggest doing this is to constrain the generated sequences to the manifold of sequences that are likely to exist in nature 
+        # and not exploiting a propensity of structure prediction networks to predict structure in alanine rich sequences
         # ==================================================================================================== 
+        'constrain_ala_gly_sampling_to_exposed_non_secondary_structure': True,
         'budget_residue_sele_string': None, 
         'ala_budget': 4, 'gly_budget': 0, # May sample up to 4 Ala and 0 Gly over the selected region if not None.
         'disable_charged_fs': True, # Disables sampling D,E,K,R residues for buried residues around the ligand. 
@@ -562,41 +576,43 @@ if __name__ == "__main__":
 
 
     params = dict(
-        debug = (debug := True),
-        use_wandb = (use_wandb := (True and not debug)),
+        debug = (debug := False),
+        use_wandb = (use_wandb := False),
 
         input_dir = Path('./debug/').resolve(),
 
-        ligand_3lc = 'EXA', # Should match CCD if using reduce.
-        ligand_rmsd_mask_atoms = {'C20', 'C21'}, # Atoms to IGNORE in RMSD calculation. 
-        ligand_atoms_enforce_buried = {'O4', 'O2', 'N3', 'F1'}, # Atoms to enforce remain buried inside convex hull when selecting new backbones.
-        ligand_atoms_enforce_exposed = {'N2'}, # Atoms to enforce remain exposed relative to the convex hull when selecting new backbones. I would suggest only using this for linker regions attached to your ligand or clearly exposed charged polar groups.
+        ligand_3lc = 'GG2', # Should match CCD code if using reduce.
+        ligand_rmsd_mask_atoms = set(), # Atoms to IGNORE in RMSD calculation. 
+        ligand_atoms_enforce_buried = set(), # Atoms to enforce remain buried inside convex hull when selecting new backbones.
+        ligand_atoms_enforce_exposed = set(), # Atoms to enforce remain exposed relative to the convex hull when selecting new backbones. I would suggest only using this for linker regions attached to your ligand or clearly exposed charged polar groups.
         laser_sampling_params = laser_sampling_params,
-        ligand_smiles = "CC[C@]1(O)C2=C(C(N3CC4=C5[C@@H]([NH3+])CCC6=C5C(N=C4C3=C2)=CC(F)=C6C)=O)COC1=O",
+        ligand_smiles = 'COC1=CC=C(C=C1)N2C3=C(CCN(C3=O)C4=CC=C(C=C4)N5CCCCC5=O)C(=N2)C(=O)N',
 
-        objective_function = (objective_function := 'ligand_plddt'), # Current options: {'ligand_plddt', 'iptm', 'pbind', 'ligand_plddt_and_pbind', 'iptm_and_pbind'}, Check the top of the file for implemented strategies, if you find an alternative strategy to work well please make a git commit so others can test it out as well!
+        objective_function = (objective_function := 'ligand_plddt'), # Current options: {'ligand_plddt', 'iptm', 'ligand_plddt_and_iptm', 'pbind', 'ligand_plddt_and_pbind', 'iptm_and_pbind'}, Check the top of the file for implemented strategies, if you find an alternative strategy to work well please make a git commit so others can test it out as well!
         drop_rmsd_mask_atoms_from_ligand_plddt_calc = True,
         keep_input_backbone_in_queue = False,
         keep_best_generator_backbone = True, # The highest scoring pose may not necessarily generate higher scoring poses, keeps the pose that has generated the best poses after the first iteration in the queue if not already the best scoring pose.
         rmsd_use_chirality = False, # Will fail to compute RMSD on mismatched chirality ligands, might be bugged...
         self_consistency_ligand_rmsd_threshold = 2.5,
-        self_consistency_protein_rmsd_threshold = 1.5,
+        self_consistency_protein_rmsd_threshold = 2.5,
 
         align_on_binding_site = False, # If align on binding site is True, protein RMSD (and self_consistency_protein_rmsd_threshold above) becomes binding site RMSD. Useful if you have a large protein with floppy regions away from the ligand. Binding site is computed as residues with sidechain atoms within 5.0A of the ligand in the lasermpnn output structure.
         fixed_identity_residue_indices = None, # An optional prody selection string of the form "resindex 0 2 3 4 5" or "resnum 1 3 5"...
 
         use_reduce_protonation = False, # If False, will use RDKit to protonate, these hydrogens will not preserve the input names and aren't placed conditioned on the sidechains but REDUCE sometimes drops hydrogens if geometry changes outside of expected bounds.
         reduce_hetdict_path = Path('./modified_hetdict.txt').absolute(), # Can set to None if use_reduce_protonation False
-        reduce_executable_path = Path('/nfs/polizzi/bfry/programs/reduce/reduce'), # Can set to None if use_reduce_protonation False
+        reduce_executable_path = None, # Can set to None if use_reduce_protonation False
 
-        model_checkpoint = Path(LASER_PATH) / 'model_weights/laser_weights_0p1A_noise_ligandmpnn_split.pt',
+        model_checkpoint = Path(LASER_PATH) / 'model_weights/laser_weights_0p1A_nothing_heldout.pt',
 
-        num_iterations = 100,
+        num_iterations = 35,
         num_top_backbones_per_round = 3,
         sequences_sampled_at_once = 30,
 
-        boltz2x_executable_path = '/nfs/polizzi/bfry/miniforge3/envs/boltz2/bin/boltz',
-        boltz_inference_devices = (boltz_inference_devices := ['cuda:0', 'cuda:1', 'cuda:2', 'cuda:3', 'cuda:4', 'cuda:5', 'cuda:6', 'cuda:7']),
+        boltz2x_executable_path = str((Path(NISE_DIRECTORY_PATH) / '.venv/bin/boltz').absolute()),
+        boltz2_cache_directory = None, # Optional path to the boltz weights, can be used to avoid redownloading weights that have already been cached on your machine not in the default location.
+        boltz2_sampling_steps = 200,
+        boltz_inference_devices = (boltz_inference_devices := ['cuda:0',]), # a list of multiple torch-style device strings
         use_boltz_conformer_potentials = True, # Use Boltz-x mode, this is almost always better.
         boltz2_predict_affinity = True if ('pbind' in objective_function) else False,
         use_boltz_1x = False, # Run the same script using --model boltz-1, multi-device inference with this seems bugged with boltz v2.1.1
