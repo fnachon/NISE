@@ -28,7 +28,80 @@ To run NISE, install the dependencies (LASErMPNN and Boltz-2) using either of th
 This will install a new python environment containing the dependencies for LASErMPNN located at `./.venv/bin/python` (the setup.sh script will print out the install location so you can verify this.)
 
 
-##### 2. Using separately installed LASErMPNN and Boltz conda environments.
+##### 2. (Also recommended on HPC) Build a self-contained Singularity/Apptainer container with CUDA.
+
+This repository ships an Apptainer definition file (`NISE.def`) that bakes every
+dependency from `setup.py` — plus the initialised submodules, the extracted
+REDUCE hetdict, the LigandMPNN model weights, and the Boltz model / CCD cache —
+into a single GPU-enabled `.sif` image. Once built you do not need `uv`, a
+system Python, or a pre-populated `~/.boltz`; just `--nv` and go.
+
+Download prebuilt image: [TODO: add `nise.sif` download link here](https://example.com/nise.sif)
+
+TODO: replace the placeholder link above with the final hosted `.sif` URL once
+the image has been uploaded for users to download.
+
+```bash
+# Rootless build (recommended on shared clusters)
+bash build_container.sh                 # -> ./nise.sif
+
+# Or manually:
+apptainer build --fakeroot nise.sif NISE.def
+# or, with root:
+sudo apptainer build nise.sif NISE.def
+```
+
+Running the container (always pass `--nv` so the NVIDIA driver is forwarded):
+
+```bash
+# Interactive shell
+apptainer shell --nv nise.sif
+
+# Quick GPU / install sanity check
+apptainer exec --nv nise.sif python -c \
+    "import torch; print(torch.cuda.is_available(), torch.cuda.device_count())"
+
+# Run the baked example scripts / apps
+apptainer run --nv --app nise-boltz2x             nise.sif
+apptainer run --nv --app nise-boltz2x-cli         nise.sif --help
+apptainer run --nv --app nise-boltz1x             nise.sif
+apptainer run --nv --app nise-boltz2x-ligandmpnn  nise.sif
+
+# Run the boltz CLI directly
+apptainer run --nv --app boltz nise.sif predict <inputs> ...
+
+# Run an arbitrary script with the container's Python env
+apptainer run --nv nise.sif /path/to/my_script.py
+```
+
+The baked install lives at `/opt/NISE` inside the container (`$NISE_HOME`),
+the Python interpreter at `/opt/NISE/.venv/bin/python`, and `/opt/NISE` is on
+`PYTHONPATH` so `from LASErMPNN.run_inference import ...` resolves from any
+working directory. Boltz defaults to the baked cache at
+`/opt/NISE/boltz_cache` via `BOLTZ_CACHE`, so the container does not depend on a
+host `~/.boltz`. Cache directories used by `pykeops`, `matplotlib`, `torch`,
+and HuggingFace default to `/tmp/*` so the read-only image is never written to.
+
+The baked CLI app is usually the easiest entry point:
+
+```bash
+apptainer run --cleanenv --nv --app nise-boltz2x-cli nise.sif \
+    --input-pdb ./example_pdbs/02_apex_NISE_input-pose_00-seq_0980_model_0_rank_01.pdb \
+    --smiles "COC1=CC=C(C=C1)N2C3=C(CCN(C3=O)C4=CC=C(C=C4)N5CCCCC5=O)C(=N2)C(=O)N" \
+    --output-dir ./debug
+```
+
+This app will prepare the input for you by default: it protonates the ligand,
+adds CONECT records, writes the prepared structure into
+`./debug/input_backbones/`, and then launches the same NISE workflow used by
+`run_nise_boltz2x.py`. If your input PDB is already protonated and has the
+desired CONECT records, add `--no-prepare-input`.
+
+Note: the `reduce` binary is *not* installed inside the container. If you want
+`use_reduce_protonation=True`, bind-mount your own copy and set
+`reduce_executable_path` accordingly in the `run_nise_*.py` scripts.
+
+##### 3. Using separately installed LASErMPNN and Boltz conda environments.
 
 You may wish to not install Boltz-2 again if it is already installed on your HPC. You can separately install LASErMPNN in its own conda environment setup the NISE repo following the instructions below.
 
@@ -73,34 +146,45 @@ WARNING: This will rename the ligand atoms, ligand chain, and resnum.
 2) [Optional] If you want to protonate using reduce (keeps added ligand hydrogen names consistent with input, a bit more finicky than the alternative RDKit), Inject your ligand into REDUCE hetdict by running `inject_ligand_into_hetdict.py {output_path}.pdb`
 
 
-3) Create an input directory with a subfolder called input_backbones. Ex: `./debug/input_backbones/`.
+3) Run the new CLI wrapper, which creates the input directory structure for you, protonates the ligand / adds CONECT records by default, and then launches the same `run_nise_boltz2x.py` design workflow without changing the design logic:
 
+```bash
+./run_nise_boltz2x_cli.py \
+    --input-pdb ./example_pdbs/02_apex_NISE_input-pose_00-seq_0980_model_0_rank_01.pdb \
+    --smiles "COC1=CC=C(C=C1)N2C3=C(CCN(C3=O)C4=CC=C(C=C4)N5CCCCC5=O)C(=N2)C(=O)N" \
+    --output-dir ./debug
+```
 
-4) Update the params dictionary at the bottom of `./run_nise_boltz1x.py` with the path to your new input dir ex: (`input_dir = Path('./debug/')`).
+This will create `./debug/input_backbones/`, write a prepared `*_protonated_conect.pdb` there, generate the helper ligand files, and run NISE with the same defaults currently hard-coded in `run_nise_boltz2x.py`.
 
+Useful CLI options:
 
-6) Update burial and RMSD atom sets and smiles string in `./run_nise_boltz1x.py`
+- `--ligand-rmsd-mask-atoms C1 C2 C3`
+- `--ligand-atoms-enforce-buried C4 C5`
+- `--ligand-atoms-enforce-exposed O1`
+- `--objective-function ligand_plddt_and_pbind`
+- `--boltz-devices cuda:0 cuda:1`
+- `--fixed-identity-residue-indices "resnum 10 12 15"`
+- `--no-prepare-input` if your input PDB is already protonated and has the CONECT records you want to preserve
+- `--dry-run` to just prepare the directory and print the resolved config
 
-
-7) Update `boltz1x_executable_path` at bottom of `./run_nise_boltz1x.py`
-
-
-8) If you want to constrain the number of alanine and glycine residues predicted on the surface of the protein in secondary-structured regions, run `identify_surface_residues.ipynb` and update 'budget_residue_sele_string' in the params dictionary at the bottom of the run_nise_boltz script.
+4) If you want to constrain the number of alanine and glycine residues predicted on the surface of the protein in secondary-structured regions, run `identify_surface_residues.ipynb` and pass the resulting selection string to `--budget-residue-sele-string`.
 
 
 To test out an example run:
 
-
 ```bash
+# Native Python / venv workflow
+./run_nise_boltz2x_cli.py \
+    --input-pdb ./example_pdbs/02_apex_NISE_input-pose_00-seq_0980_model_0_rank_01.pdb \
+    --smiles "COC1=CC=C(C=C1)N2C3=C(CCN(C3=O)C4=CC=C(C=C4)N5CCCCC5=O)C(=N2)C(=O)N" \
+    --output-dir ./debug
 
-# Use protonated smiles string from ChemDraw or OpenBabel prediction
-./.venv/bin/python ./protonate_and_add_conect_records.py ./example_pdbs/02_apex_NISE_input-pose_00-seq_0980_model_0_rank_01.pdb "COC1=CC=C(C=C1)N2C3=C(CCN(C3=O)C4=CC=C(C=C4)N5CCCCC5=O)C(=N2)C(=O)N" ./example_pdbs/test_input_protonated_conect.pdb
-
-mkdir -p ./debug/input_backbones/
-
-cp ./example_pdbs/test_input_protonated_conect.pdb ./debug/input_backbones/
-
-./run_nise_boltz2x.py
+# Apptainer workflow using the baked CLI app
+apptainer run --cleanenv --nv --app nise-boltz2x-cli nise.sif \
+    --input-pdb ./example_pdbs/02_apex_NISE_input-pose_00-seq_0980_model_0_rank_01.pdb \
+    --smiles "COC1=CC=C(C=C1)N2C3=C(CCN(C3=O)C4=CC=C(C=C4)N5CCCCC5=O)C(=N2)C(=O)N" \
+    --output-dir ./debug
 ```
 
 

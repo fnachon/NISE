@@ -1,0 +1,319 @@
+Bootstrap: docker
+From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+
+%labels
+    Maintainer       Polizzi Lab
+    Description      NISE (Neural Iterative Selection Expansion) with CUDA + Boltz-2x + LASErMPNN + LigandMPNN
+    Version          1.0.0
+    Torch            2.8.0
+    CUDA             12.8
+    Python           3.11
+
+###############################################################################
+# The entire NISE repository (including .git so that submodule SHAs are pinned)
+# is copied into /opt/NISE inside the image. %files runs BEFORE %post.
+###############################################################################
+%files
+    . /opt/NISE
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+
+    # Baked-in NISE install
+    export NISE_HOME=/opt/NISE
+    export VIRTUAL_ENV=/opt/NISE/.venv
+    export PATH=/opt/NISE/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+    # Make LASErMPNN / utility_scripts importable regardless of script CWD
+    export PYTHONPATH=/opt/NISE:${PYTHONPATH:-}
+
+    # CUDA (the --nv flag at runtime injects the host's NVIDIA driver libs;
+    # the toolkit (nvcc, headers) comes from the base image and is needed
+    # for pykeops JIT compilation).
+    export CUDA_HOME=/usr/local/cuda
+    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+
+    # Redirect caches to writable locations (image rootfs is read-only at run time)
+    export PYKEOPS_CACHE_DIR=${PYKEOPS_CACHE_DIR:-/tmp/pykeops_cache}
+    export NUMBA_CACHE_DIR=${NUMBA_CACHE_DIR:-/tmp/numba_cache}
+    export MPLCONFIGDIR=${MPLCONFIGDIR:-/tmp/matplotlib_cache}
+    export TORCH_HOME=${TORCH_HOME:-/tmp/torch_cache}
+    export HF_HOME=${HF_HOME:-/tmp/hf_cache}
+    export XDG_CACHE_HOME=${XDG_CACHE_HOME:-/tmp/xdg_cache}
+
+    # Prefer the baked Boltz weights inside the image over any host ~/.boltz.
+    export BOLTZ_CACHE=/opt/NISE/boltz_cache
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    ###########################################################################
+    # 1. System packages (compilers, curl, git, X11 stubs for RDKit drawing,
+    #    OpenMP, etc.).  The base image already supplies CUDA toolkit + cuDNN.
+    ###########################################################################
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        git \
+        gnupg \
+        libglib2.0-0 \
+        libgomp1 \
+        libsm6 \
+        libssl-dev \
+        libstdc++6 \
+        libx11-6 \
+        libxext6 \
+        libxrender1 \
+        ninja-build \
+        pkg-config \
+        wget \
+        zlib1g-dev
+    rm -rf /var/lib/apt/lists/*
+
+    ###########################################################################
+    # 2. Install uv (fast Python package manager) system-wide.
+    ###########################################################################
+    curl -LsSf https://astral.sh/uv/install.sh \
+        | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+    command -v uv
+    uv --version
+
+    ###########################################################################
+    # 3. Bake NISE assets: submodules, REDUCE hetdict, LigandMPNN weights.
+    ###########################################################################
+    cd /opt/NISE
+    git config --global --add safe.directory /opt/NISE
+    git config --global --add safe.directory '*'
+
+    # 3a. Initialise submodules (uses .git + .gitmodules copied in via %files).
+    if [ -d .git ] && git rev-parse --git-dir >/dev/null 2>&1; then
+        git submodule update --init --recursive
+    else
+        echo "No .git dir found; cloning submodules by URL (unpinned)."
+        rm -rf LASErMPNN LigandMPNN
+        git clone https://github.com/polizzilab/LASErMPNN.git LASErMPNN
+        git clone https://github.com/dauparas/LigandMPNN.git  LigandMPNN
+    fi
+
+    # 3b. Extract REDUCE hetdict (noop if already extracted).
+    if [ -f hetdict.tar.gz ] && ! ls reduce_wwPDB_het_dict*.txt >/dev/null 2>&1; then
+        tar -xvf hetdict.tar.gz
+    fi
+
+    # 3c. Download LigandMPNN model weights if the submodule supplies the
+    #     helper script and weights are not already present.
+    if [ -f LigandMPNN/get_model_params.sh ]; then
+        cd /opt/NISE/LigandMPNN
+        if [ ! -d model_params ] || [ -z "$(ls -A model_params 2>/dev/null)" ]; then
+            bash get_model_params.sh ./model_params
+        fi
+        cd /opt/NISE
+    fi
+
+    ###########################################################################
+    # 4. Create the Python virtual environment and install all NISE deps.
+    #    Mirrors setup.py, but bakes everything into /opt/NISE/.venv.
+    ###########################################################################
+    rm -rf /opt/NISE/.venv
+    uv venv --python 3.11 --seed /opt/NISE/.venv
+
+    VENV_PY=/opt/NISE/.venv/bin/python
+    export UV_PYTHON="$VENV_PY"
+
+    uv pip install --python "$VENV_PY" \
+        pip \
+        torch==2.8.0 \
+        "numpy<2.0.0" \
+        scipy \
+        pandas \
+        scikit-learn \
+        h5py \
+        pytest \
+        prody \
+        matplotlib \
+        rdkit-to-params \
+        seaborn \
+        pydssp \
+        jupyter \
+        plotly \
+        pykeops \
+        logomaker \
+        wandb \
+        tqdm \
+        rdkit \
+        py3Dmol \
+        openbabel-wheel \
+        "boltz[cuda]==2.2.1" \
+        freesasa
+
+    # 4a. PyG extensions (torch_scatter, torch_cluster) matching the installed
+    #     torch build.  Uses the same detection logic as setup.py.
+    "$VENV_PY" - <<'PYEOF'
+import re, subprocess, sys, torch
+print("Torch version :", torch.__version__)
+print("Torch CUDA    :", torch.version.cuda)
+
+m = re.match(r"^(\d+\.\d+\.\d+)(\+cu\d+)?", torch.__version__)
+if m is None:
+    raise SystemExit(f"Unexpected torch version: {torch.__version__}")
+base, cu = m.groups()
+cu = cu or "+cpu"
+url = f"https://data.pyg.org/whl/torch-{base}{cu}.html"
+print("PyG wheel index:", url)
+
+subprocess.check_call([
+    sys.executable, "-m", "pip", "install",
+    "torch_scatter", "torch_cluster",
+    "-f", url,
+])
+PYEOF
+
+    ###########################################################################
+    # 4b. Bake the Boltz weights and CCD cache into the image so runtime does
+    #     not depend on a host ~/.boltz bind mount.
+    ###########################################################################
+    export BOLTZ_CACHE=/opt/NISE/boltz_cache
+    mkdir -p "$BOLTZ_CACHE"
+    "$VENV_PY" - <<'PYEOF'
+from pathlib import Path
+from boltz.main import download_boltz1, download_boltz2
+
+cache = Path("/opt/NISE/boltz_cache")
+cache.mkdir(parents=True, exist_ok=True)
+
+print("Downloading baked Boltz cache into", cache)
+download_boltz1(cache)
+download_boltz2(cache)
+
+expected = [
+    cache / "ccd.pkl",
+    cache / "boltz1_conf.ckpt",
+    cache / "boltz2_conf.ckpt",
+    cache / "boltz2_aff.ckpt",
+    cache / "mols",
+]
+missing = [str(p) for p in expected if not p.exists()]
+if missing:
+    raise SystemExit(f"Missing expected Boltz cache contents: {missing}")
+
+print("Baked Boltz cache contents:")
+for name in sorted(p.name for p in cache.iterdir()):
+    print("  ", name)
+PYEOF
+
+    ###########################################################################
+    # 5. Permissions: make everything world-readable/executable so that any
+    #    UID running the container can use the baked install.
+    ###########################################################################
+    chmod -R a+rX /opt/NISE
+    find /opt/NISE -type d -exec chmod a+rx {} \;
+
+    ###########################################################################
+    # 6. Import smoke test (does NOT require a GPU at build time).
+    ###########################################################################
+    "$VENV_PY" - <<'PYEOF'
+import importlib, sys
+mods = [
+    "torch", "numpy", "scipy", "pandas", "sklearn", "h5py", "prody",
+    "matplotlib", "seaborn", "plotly", "pykeops", "wandb", "tqdm",
+    "rdkit", "py3Dmol", "rdkit_to_params", "boltz", "freesasa",
+    "torch_scatter", "torch_cluster",
+]
+for m in mods:
+    importlib.import_module(m)
+    print("ok  ", m)
+import torch
+print("Torch:", torch.__version__, "| CUDA build:", torch.version.cuda)
+PYEOF
+
+%runscript
+    # Default: invoke the baked venv's Python with whatever args the user passes.
+    exec /opt/NISE/.venv/bin/python "$@"
+
+%apprun boltz
+    exec /opt/NISE/.venv/bin/boltz "$@"
+
+%apprun nise-boltz2x
+    exec /opt/NISE/.venv/bin/python /opt/NISE/run_nise_boltz2x.py "$@"
+
+%apprun nise-boltz2x-cli
+    exec /opt/NISE/.venv/bin/python /opt/NISE/run_nise_boltz2x_cli.py "$@"
+
+%apprun nise-boltz1x
+    exec /opt/NISE/.venv/bin/python /opt/NISE/run_nise_boltz1x.py "$@"
+
+%apprun nise-boltz2x-ligandmpnn
+    exec /opt/NISE/.venv/bin/python /opt/NISE/run_nise_boltz2x_ligandmpnn.py "$@"
+
+%apprun jupyter
+    exec /opt/NISE/.venv/bin/jupyter "$@"
+
+%test
+    /opt/NISE/.venv/bin/python - <<'PYEOF'
+import torch, boltz, rdkit, prody, pykeops
+from pathlib import Path
+print("NISE container self-test OK")
+print("  torch       :", torch.__version__)
+print("  torch.cuda  :", torch.version.cuda)
+print("  boltz       :", boltz.__file__)
+print("  BOLTZ_CACHE :", Path("/opt/NISE/boltz_cache"), Path("/opt/NISE/boltz_cache").exists())
+PYEOF
+
+%help
+    NISE Singularity/Apptainer container
+    =====================================
+    CUDA 12.8 + PyTorch 2.8.0 + Boltz-2x (2.2.1) + LASErMPNN + LigandMPNN
+    with every Python dependency from setup.py pre-installed at
+    /opt/NISE/.venv and the REDUCE hetdict + LigandMPNN model weights + Boltz
+    weights / CCD cache baked into /opt/NISE.
+
+    -----------------------------------------------------------------------
+    Build
+    -----------------------------------------------------------------------
+        # Rootless (recommended on shared HPC):
+        apptainer build --fakeroot nise.sif NISE.def
+
+        # Or with root:
+        sudo apptainer build nise.sif NISE.def
+
+    -----------------------------------------------------------------------
+    Run  (ALWAYS pass --nv so GPUs are visible)
+    -----------------------------------------------------------------------
+        # Interactive shell
+        apptainer shell --nv nise.sif
+
+        # Run the baked example scripts (edit them via an overlay or copy
+        # them to a bind-mounted workdir first):
+        apptainer run --nv --app nise-boltz2x              nise.sif
+        apptainer run --nv --app nise-boltz2x-cli          nise.sif --help
+        apptainer run --nv --app nise-boltz1x              nise.sif
+        apptainer run --nv --app nise-boltz2x-ligandmpnn   nise.sif
+
+        # Call the boltz CLI directly
+        apptainer run --nv --app boltz nise.sif predict <inputs> ...
+
+        # Run an arbitrary Python script with the container's env
+        apptainer run --nv nise.sif /path/to/my_script.py
+
+        # Quick GPU check
+        apptainer exec --nv nise.sif python -c \
+            "import torch; print(torch.cuda.is_available(), torch.cuda.device_count())"
+
+    -----------------------------------------------------------------------
+    Notes
+    -----------------------------------------------------------------------
+    * The environment variable NISE_HOME=/opt/NISE points to the baked
+      installation and /opt/NISE is on PYTHONPATH, so
+      `from LASErMPNN.run_inference import ...` works from any CWD.
+    * Boltz defaults to the baked cache at /opt/NISE/boltz_cache via
+      BOLTZ_CACHE, so it does not need a host ~/.boltz cache.
+    * Cache dirs (pykeops, matplotlib, torch hub, HuggingFace) default to
+      /tmp/* so the read-only image FS is never written to.
+    * REDUCE (`reduce` binary) is NOT installed; bind-mount your own copy
+      and set `reduce_executable_path` in the run_nise_*.py scripts if
+      you want `use_reduce_protonation=True`.
