@@ -15,7 +15,7 @@ Jointly optimize the sequence and structure of a protein-ligand binding pose wit
 
 ### Installing NISE Environment
 
-To run NISE, install the dependencies (LASErMPNN and Boltz-2) using either of the methods below:
+To run NISE, install the dependencies (LASErMPNN and Boltz-2) using one of the methods below:
 
 ##### 1. (Recommended) Create a Virtual Environment (venv) inside this repository.
 
@@ -28,58 +28,11 @@ To run NISE, install the dependencies (LASErMPNN and Boltz-2) using either of th
 This will install a new python environment containing the dependencies for LASErMPNN located at `./.venv/bin/python` (the setup.sh script will print out the install location so you can verify this.)
 
 
-##### 2. (Also recommended on HPC) Build a self-contained Singularity/Apptainer container with CUDA.
+##### 2. (Also recommended on HPC) Use the prebuilt Singularity/Apptainer container.
 
-This repository ships an Apptainer definition file (`NISE.def`) that bakes every
-dependency from `setup.py` — plus the initialised submodules, the extracted
-REDUCE hetdict, the LigandMPNN model weights, and the Boltz model / CCD cache —
-into a single GPU-enabled `.sif` image. Once built you do not need `uv`, a
-system Python, or a pre-populated `~/.boltz`; just `--nv` and go.
+Download the prebuilt image: [`nise.sif`](https://huggingface.co/benf549/NISE/blob/main/nise.sif)
 
-Download prebuilt image: [`nise.sif`](https://huggingface.co/benf549/NISE/blob/main/nise.sif)
-
-```bash
-# Rootless build (recommended on shared clusters)
-bash build_container.sh                 # -> ./nise.sif
-
-# Or manually:
-apptainer build --fakeroot nise.sif NISE.def
-# or, with root:
-sudo apptainer build nise.sif NISE.def
-```
-
-Running the container (always pass `--nv` so the NVIDIA driver is forwarded):
-
-```bash
-# Interactive shell
-apptainer shell --nv nise.sif
-
-# Quick GPU / install sanity check
-apptainer exec --nv nise.sif python -c \
-    "import torch; print(torch.cuda.is_available(), torch.cuda.device_count())"
-
-# Run the baked example scripts / apps
-apptainer run --nv --app nise-boltz2x             nise.sif
-apptainer run --nv --app nise-boltz2x-cli         nise.sif --help
-apptainer run --nv --app nise-boltz1x             nise.sif
-apptainer run --nv --app nise-boltz2x-ligandmpnn  nise.sif
-
-# Run the boltz CLI directly
-apptainer run --nv --app boltz nise.sif predict <inputs> ...
-
-# Run an arbitrary script with the container's Python env
-apptainer run --nv nise.sif /path/to/my_script.py
-```
-
-The baked install lives at `/opt/NISE` inside the container (`$NISE_HOME`),
-the Python interpreter at `/opt/NISE/.venv/bin/python`, and `/opt/NISE` is on
-`PYTHONPATH` so `from LASErMPNN.run_inference import ...` resolves from any
-working directory. Boltz defaults to the baked cache at
-`/opt/NISE/boltz_cache` via `BOLTZ_CACHE`, so the container does not depend on a
-host `~/.boltz`. Cache directories used by `pykeops`, `matplotlib`, `torch`,
-and HuggingFace default to `/tmp/*` so the read-only image is never written to.
-
-The baked CLI app is usually the easiest entry point:
+Run the baked CLI app with `--nv` so the NVIDIA driver is forwarded:
 
 ```bash
 apptainer run --cleanenv --nv --app nise-boltz2x-cli nise.sif \
@@ -88,15 +41,8 @@ apptainer run --cleanenv --nv --app nise-boltz2x-cli nise.sif \
     --output-dir ./debug
 ```
 
-This app will prepare the input for you by default: it protonates the ligand,
-adds CONECT records, writes the prepared structure into
-`./debug/input_backbones/`, and then launches the same NISE workflow used by
-`run_nise_boltz2x.py`. If your input PDB is already protonated and has the
-desired CONECT records, add `--no-prepare-input`.
-
-Note: the `reduce` binary is *not* installed inside the container. If you want
-`use_reduce_protonation=True`, bind-mount your own copy and set
-`reduce_executable_path` accordingly in the `run_nise_*.py` scripts.
+Advanced users who want to build or customize the container should see
+[`APPTAINER.md`](./APPTAINER.md).
 
 ##### 3. Using separately installed LASErMPNN and Boltz conda environments.
 
@@ -260,3 +206,8 @@ cp ./example_pdbs/02_apex_NISE_input-pose_00-seq_0980_model_0_rank_01.pdb ./debu
 
 ./run_nise_boltz2x_ligandmpnn.py
 ```
+
+### Advanced container documentation
+
+For details on building or customizing the Apptainer/Singularity container, see
+[`APPTAINER.md`](./APPTAINER.md).
