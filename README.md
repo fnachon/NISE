@@ -36,10 +36,7 @@ REDUCE hetdict, the LigandMPNN model weights, and the Boltz model / CCD cache â€
 into a single GPU-enabled `.sif` image. Once built you do not need `uv`, a
 system Python, or a pre-populated `~/.boltz`; just `--nv` and go.
 
-Download prebuilt image: [TODO: add `nise.sif` download link here](https://example.com/nise.sif)
-
-TODO: replace the placeholder link above with the final hosted `.sif` URL once
-the image has been uploaded for users to download.
+Download prebuilt image: [`nise.sif`](https://huggingface.co/benf549/NISE/blob/main/nise.sif)
 
 ```bash
 # Rootless build (recommended on shared clusters)
@@ -138,15 +135,14 @@ Initializations from RFDiffusion2/3, BoltzDesign1 or BoltzGen will almost certai
 
 ### Running NISE:
 
-1) Create a PDB file containing your PROTONATED input ligand with CONECT records encoding bonds (unless using NISE with LigandMPNN, then protonation is not necessary).:
-If you have a non-protonated ligand/are missing conect records, run `protonate_and_add_conect_records.py {input_path}.pdb {smiles_string} {output_path}.pdb`.
-WARNING: This will rename the ligand atoms, ligand chain, and resnum.
+You can run NISE either through the CLI wrapper or by copying and editing the
+`run_nise_boltz2x.py` script for a specific design campaign. The former is easier to run while the latter is easier to tweak and extend the design protocol with your own modifications.
 
+##### 1. Running NISE with the CLI wrapper.
 
-2) [Optional] If you want to protonate using reduce (keeps added ligand hydrogen names consistent with input, a bit more finicky than the alternative RDKit), Inject your ligand into REDUCE hetdict by running `inject_ligand_into_hetdict.py {output_path}.pdb`
-
-
-3) Run the new CLI wrapper, which creates the input directory structure for you, protonates the ligand / adds CONECT records by default, and then launches the same `run_nise_boltz2x.py` design workflow without changing the design logic:
+The CLI wrapper creates the input directory structure for you, protonates the
+ligand / adds CONECT records by default, and then launches the same
+`run_nise_boltz2x.py` design workflow without changing the design logic:
 
 ```bash
 ./run_nise_boltz2x_cli.py \
@@ -155,7 +151,22 @@ WARNING: This will rename the ligand atoms, ligand chain, and resnum.
     --output-dir ./debug
 ```
 
-This will create `./debug/input_backbones/`, write a prepared `*_protonated_conect.pdb` there, generate the helper ligand files, and run NISE with the same defaults currently hard-coded in `run_nise_boltz2x.py`.
+This will create `./debug/input_backbones/`, write a prepared
+`*_protonated_conect.pdb` there, generate the helper ligand files, and run NISE
+with the same defaults currently hard-coded in `run_nise_boltz2x.py`.
+
+If your input PDB is already protonated and has the CONECT records you want to
+preserve, add `--no-prepare-input`.
+
+Important: the default CLI preparation step uses `protonate_and_add_conect_records.py`,
+which renames ligand atoms sequentially by element. If you pass
+`--ligand-rmsd-mask-atoms`, `--ligand-atoms-enforce-buried`, or
+`--ligand-atoms-enforce-exposed` with the original input atom names, the CLI
+will map those names onto the prepared PDB before running NISE.
+
+The CLI also writes `nise_cli_args.json` in the output directory, recording the
+raw command-line arguments, parsed arguments, any remapped ligand atom names, and
+the final parameters passed into NISE.
 
 Useful CLI options:
 
@@ -165,11 +176,9 @@ Useful CLI options:
 - `--objective-function ligand_plddt_and_pbind`
 - `--boltz-devices cuda:0 cuda:1`
 - `--fixed-identity-residue-indices "resnum 10 12 15"`
+- `--budget-residue-sele-string "resnum 10 12 15"`
 - `--no-prepare-input` if your input PDB is already protonated and has the CONECT records you want to preserve
 - `--dry-run` to just prepare the directory and print the resolved config
-
-4) If you want to constrain the number of alanine and glycine residues predicted on the surface of the protein in secondary-structured regions, run `identify_surface_residues.ipynb` and pass the resulting selection string to `--budget-residue-sele-string`.
-
 
 To test out an example run:
 
@@ -185,6 +194,59 @@ apptainer run --cleanenv --nv --app nise-boltz2x-cli nise.sif \
     --input-pdb ./example_pdbs/02_apex_NISE_input-pose_00-seq_0980_model_0_rank_01.pdb \
     --smiles "COC1=CC=C(C=C1)N2C3=C(CCN(C3=O)C4=CC=C(C=C4)N5CCCCC5=O)C(=N2)C(=O)N" \
     --output-dir ./debug
+```
+
+##### 2. Running NISE by copying `run_nise_boltz2x.py`.
+
+Use this workflow when you want to edit the campaign parameters directly in a
+script instead of passing CLI options.
+
+1) Copy the template script for your campaign:
+
+```bash
+cp run_nise_boltz2x.py my_run_nise_boltz2x.py
+```
+
+If you move the copied script outside the NISE repository, update
+`NISE_DIRECTORY_PATH` at the top of the copied file.
+
+2) Prepare a PDB file containing your PROTONATED input ligand with CONECT
+records encoding bonds. If you have a non-protonated ligand or are missing
+CONECT records, run:
+
+```bash
+protonate_and_add_conect_records.py {input_path}.pdb {smiles_string} {output_path}.pdb
+```
+
+WARNING: This will rename the ligand atoms, ligand chain, and resnum.
+
+3) [Optional] If you want to protonate using reduce (keeps added ligand
+hydrogen names consistent with input, but is a bit more finicky than the
+alternative RDKit), inject your ligand into REDUCE hetdict by running:
+
+```bash
+inject_ligand_into_hetdict.py {output_path}.pdb
+```
+
+4) Create the input directory and copy your prepared PDB into it:
+
+```bash
+mkdir -p ./debug/input_backbones/
+cp {output_path}.pdb ./debug/input_backbones/
+```
+
+5) Edit the `params` dictionary at the bottom of your copied script. At minimum,
+set `input_dir`, `ligand_smiles`, `boltz_inference_devices`, and any objective
+or residue constraints you want to use. If you want to constrain the number of
+alanine and glycine residues predicted on the surface of the protein in
+secondary-structured regions, run `identify_surface_residues.ipynb` and set the
+resulting selection string as `budget_residue_sele_string` inside
+`laser_sampling_params`.
+
+6) Run your copied script:
+
+```bash
+./.venv/bin/python my_run_nise_boltz2x.py
 ```
 
 

@@ -24,6 +24,7 @@ Run with `-h` for the full list of options.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -349,6 +350,91 @@ def prepare_input_directory(
     return output_dir, dest
 
 
+def remap_ligand_atom_sets_after_prepare(
+    args: argparse.Namespace,
+    prepared_backbone_path: Path,
+) -> None:
+    atom_name_constraints = (
+        args.ligand_rmsd_mask_atoms
+        | args.ligand_atoms_enforce_buried
+        | args.ligand_atoms_enforce_exposed
+    )
+    if not args.prepare_input or not atom_name_constraints:
+        return
+
+    from utility_scripts.calc_symmetry_aware_rmsd import main as calc_rmsd
+
+    _, _, name_mapping = calc_rmsd(args.input_pdb, prepared_backbone_path, args.smiles)
+    if not name_mapping:
+        raise SystemExit(
+            "ERROR: failed to map ligand atom names from the input PDB to the "
+            "prepared PDB. Try preparing the PDB manually and rerun with "
+            "--no-prepare-input."
+        )
+
+    missing_atom_names = sorted(atom_name_constraints - set(name_mapping))
+    if missing_atom_names:
+        missing = ", ".join(missing_atom_names)
+        raise SystemExit(
+            "ERROR: ligand atom names were not found in the input PDB mapping: "
+            f"{missing}"
+        )
+
+    args.ligand_rmsd_mask_atoms = {
+        name_mapping[name] for name in args.ligand_rmsd_mask_atoms
+    }
+    args.ligand_atoms_enforce_buried = {
+        name_mapping[name] for name in args.ligand_atoms_enforce_buried
+    }
+    args.ligand_atoms_enforce_exposed = {
+        name_mapping[name] for name in args.ligand_atoms_enforce_exposed
+    }
+
+    print("[prepare] remapped ligand atom-name options onto prepared PDB names:")
+    for original_name in sorted(atom_name_constraints):
+        print(f"[prepare]   {original_name} -> {name_mapping[original_name]}")
+
+
+def _json_safe(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, set):
+        return sorted(value)
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, argparse.Namespace):
+        return _json_safe(vars(value))
+    return value
+
+
+def write_cli_args_manifest(
+    output_dir: Path,
+    raw_argv: list[str],
+    original_args: dict,
+    resolved_args: argparse.Namespace,
+    prepared_backbone_path: Path,
+    params: dict,
+) -> Path:
+    manifest_path = output_dir / "nise_cli_args.json"
+    manifest = {
+        "command": [Path(sys.argv[0]).name, *raw_argv],
+        "raw_argv": raw_argv,
+        "parsed_args_original": original_args,
+        "parsed_args_resolved": _json_safe(resolved_args),
+        "prepared_backbone_path": str(prepared_backbone_path),
+        "params": _json_safe(params),
+    }
+    with manifest_path.open("w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"[run] wrote CLI argument manifest = {manifest_path}")
+    return manifest_path
+
+
 # -----------------------------------------------------------------------------
 # Build the params dict that run_nise_boltz2x.main() consumes
 # -----------------------------------------------------------------------------
@@ -433,13 +519,15 @@ def build_params(args: argparse.Namespace, input_dir: Path) -> dict:
 # -----------------------------------------------------------------------------
 # Validation
 # -----------------------------------------------------------------------------
-def validate(args: argparse.Namespace, params: dict) -> None:
+def validate_args_before_prepare(args: argparse.Namespace) -> None:
     if args.prepare_input and args.link:
         raise SystemExit(
             "ERROR: --link cannot be used with the default input preparation step. "
             "Use --no-prepare-input if you want to link an already-prepared PDB."
         )
 
+
+def validate(args: argparse.Namespace, params: dict) -> None:
     if args.use_boltz_1x and params["boltz2_predict_affinity"]:
         raise SystemExit("ERROR: --use-boltz-1x is incompatible with affinity prediction.")
 
@@ -488,7 +576,10 @@ def validate(args: argparse.Namespace, params: dict) -> None:
 # Entry point
 # -----------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(argv)
+    original_args = _json_safe(args)
+    validate_args_before_prepare(args)
 
     input_dir, prepared_backbone_path = prepare_input_directory(
         args.output_dir,
@@ -498,9 +589,11 @@ def main(argv: list[str] | None = None) -> int:
         link=args.link,
         overwrite=args.overwrite_input_backbones,
     )
+    remap_ligand_atom_sets_after_prepare(args, prepared_backbone_path)
 
     params = build_params(args, input_dir)
     validate(args, params)
+    write_cli_args_manifest(input_dir, raw_argv, original_args, args, prepared_backbone_path, params)
 
     print(f"[run] NISE_DIRECTORY_PATH = {NISE_DIRECTORY_PATH}")
     print(f"[run] input_dir          = {input_dir}")
