@@ -9,7 +9,13 @@
 set -euo pipefail
 
 OUT="${1:-nise.sif}"
-DEF="$(dirname "$(readlink -f "$0")")/NISE.def"
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+DEF="$SCRIPT_DIR/NISE.def"
+
+cd "$SCRIPT_DIR"
+
+echo "Removing existing .sif artifacts from the build context..."
+rm -f ./*.sif ./*.sif.*
 
 if command -v apptainer >/dev/null 2>&1; then
     RUNTIME=apptainer
