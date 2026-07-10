@@ -212,4 +212,4 @@ cp ./example_pdbs/02_apex_NISE_input-pose_00-seq_0980_model_0_rank_01.pdb ./debu
 For details on building or customizing the Apptainer/Singularity container, see
 [`APPTAINER.md`](./APPTAINER.md).
 
-### For a complete example design campaign (generated a $K_d = 80 \pm 40$ picoMolar binder to apixaban), check out the contents of [example_design_campaign](./example_design_campaign/)
+### For a complete example design campaign (generated a $K_d = 80 \pm 40$ picomolar binder to apixaban), check out the contents of [example_design_campaign](./example_design_campaign/)
