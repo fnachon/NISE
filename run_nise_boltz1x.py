@@ -20,8 +20,10 @@ from typing import *
 
 # NOTE: If you move the run_nise*.py script, adjust the NISE_DIRECTORY_PATH
 NISE_DIRECTORY_PATH = str(Path(os.path.abspath(__file__)).parent)
-LASER_PATH = str(Path(NISE_DIRECTORY_PATH) / 'LASErMPNN')
+# Points at florian's own LASErMPNN checkout instead of the bundled submodule.
+LASER_PATH = '/Users/florian/Documents/Science-IA/LASErMPNN'
 sys.path.append(NISE_DIRECTORY_PATH)
+sys.path.insert(0, str(Path(LASER_PATH).parent))
 
 import wandb
 import torch
@@ -330,10 +332,19 @@ class DesignCampaign:
             wandb.log(logs)
     
 
+def _boltz_device_args(boltz_inference_devices):
+    """Builds the (env_var_prefix, cli_flags) pair for boltz's device selection. CUDA_VISIBLE_DEVICES / --devices N only makes sense for CUDA GPUs; Apple Silicon exposes a single 'mps' device."""
+    if all(d.startswith('cuda') for d in boltz_inference_devices):
+        device_ints = [d.split(':')[-1] for d in boltz_inference_devices]
+        return f'CUDA_VISIBLE_DEVICES={",".join(device_ints)} ', f'--devices {len(device_ints)} --accelerator gpu'
+    accelerator = 'mps' if boltz_inference_devices[0].startswith('mps') else 'cpu'
+    return '', f'--devices 1 --accelerator {accelerator}'
+
+
 def predict_complex_structures(boltz_inputs_dir, boltz1x_executable_path, boltz_inference_devices, boltz_output_dir, disable_nccl_p2p, debug):
-    device_ints = [x.split(':')[-1] for x in boltz_inference_devices]
-    command = f'{boltz1x_executable_path} predict {boltz_inputs_dir} --devices {len(device_ints)} --out_dir {boltz_output_dir} --output_format pdb --override'
-    command = f'CUDA_VISIBLE_DEVICES={",".join(device_ints)} {command}'
+    env_prefix, device_flags = _boltz_device_args(boltz_inference_devices)
+    command = f'{boltz1x_executable_path} predict {boltz_inputs_dir} {device_flags} --out_dir {boltz_output_dir} --output_format pdb --override'
+    command = f'{env_prefix}{command}'
 
     if disable_nccl_p2p:
         command = f'NCCL_P2P_DISABLE=1 {command}'
@@ -490,7 +501,7 @@ if __name__ == "__main__":
 
         use_reduce_protonation = False, # If False, will use RDKit to protonate, these hydrogens will not preserve the input names.
         reduce_hetdict_path = Path('./modified_hetdict.txt').absolute(), # Can set to None if use_reduce_protonation False
-        reduce_executable_path = Path('/nfs/polizzi/bfry/programs/reduce/reduce'), # Can set to None if use_reduce_protonation False
+        reduce_executable_path = Path('/Users/florian/miniconda3/envs/amber/bin/reduce'), # Can set to None if use_reduce_protonation False
 
         model_checkpoint = Path(LASER_PATH) / 'model_weights/laser_weights_0p1A_noise_ligandmpnn_split.pt',
 
@@ -498,8 +509,8 @@ if __name__ == "__main__":
         num_top_backbones_per_round = 3,
         sequences_sampled_at_once = 30,
 
-        boltz1x_executable_path = '/nfs/polizzi/bfry/miniforge3/envs/boltz1x/bin/boltz',
-        boltz_inference_devices = (boltz_inference_devices := ['cuda:0', 'cuda:1', 'cuda:2', 'cuda:3', 'cuda:4', 'cuda:5', 'cuda:6', 'cuda:7']),
+        boltz1x_executable_path = '/Users/florian/miniconda3/envs/boltz-2/bin/boltz',
+        boltz_inference_devices = (boltz_inference_devices := ['mps']), # Apple Silicon exposes a single unified GPU device.
         boltz1x_disable_nccl_p2p = False, # On some systems with certain graphics cards, NCCL can hang indefinitely. This flag fixes this issue allowing running boltz / NISE with multiple GPUs. https://github.com/NVIDIA/nccl/issues/631 
 
         sequences_sampled_per_backbone = 64 if not debug else 2 * len(boltz_inference_devices),

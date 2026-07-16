@@ -39,9 +39,9 @@ sys.path.insert(0, str(NISE_DIRECTORY_PATH))
 # -----------------------------------------------------------------------------
 # Defaults (mirror the params dict at the bottom of run_nise_boltz2x.py).
 # -----------------------------------------------------------------------------
-DEFAULT_MODEL_CHECKPOINT = (
-    NISE_DIRECTORY_PATH / "LASErMPNN" / "model_weights" / "laser_weights_0p1A_nothing_heldout.pt"
-)
+# Points at florian's own LASErMPNN checkout instead of the bundled submodule.
+LASERMPNN_REPO_PATH = Path('/Users/florian/Documents/Science-IA/LASErMPNN')
+DEFAULT_MODEL_CHECKPOINT = LASERMPNN_REPO_PATH / "model_weights" / "laser_weights_0p1A_nothing_heldout.pt"
 DEFAULT_BOLTZ_EXECUTABLE = NISE_DIRECTORY_PATH / ".venv" / "bin" / "boltz"
 DEFAULT_REDUCE_HETDICT = NISE_DIRECTORY_PATH / "reduce_wwPDB_het_dict_two_letter_bug_fixed.txt"
 
@@ -228,8 +228,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--boltz-executable", type=Path, default=DEFAULT_BOLTZ_EXECUTABLE,
     )
     boltz_grp.add_argument(
-        "--boltz-devices", type=str, nargs="+", default=["cuda:0"],
-        help="Torch-style device strings, e.g. --boltz-devices cuda:0 cuda:1.",
+        "--boltz-devices", type=str, nargs="+", default=["mps"],
+        help="Torch-style device strings, e.g. --boltz-devices cuda:0 cuda:1, or ['mps'] on Apple Silicon.",
     )
     boltz_grp.add_argument("--boltz2-sampling-steps", type=int, default=200)
     boltz_grp.add_argument(

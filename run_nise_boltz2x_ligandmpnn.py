@@ -16,6 +16,9 @@ warnings.filterwarnings("ignore")
 NISE_DIRECTORY_PATH = str(Path(os.path.abspath(__file__)).parent)
 sys.path.append(NISE_DIRECTORY_PATH)
 
+# Points at florian's own LigandMPNN checkout instead of the bundled submodule.
+LIGANDMPNN_REPO_PATH = '/Users/florian/Documents/Science-IA/LigandMPNN'
+
 import wandb
 import torch
 import plotly
@@ -219,8 +222,10 @@ class DesignCampaign:
         assert self.params_path.exists(), f"Error creating params file {self.params_path}"
 
     def sample_sequences(self, backbone_path: Path, lmpnn_output_subdir: Path) -> Tuple[List[pr.AtomGroup], List[str], List[float], List[float]]:
-        sample_command = f'cd LigandMPNN;'
-        sample_command += f' CUDA_VISIBLE_DEVICES={self.lmpnn_inference_device.split(":")[-1]}'
+        sample_command = f'cd {LIGANDMPNN_REPO_PATH};'
+        # CUDA_VISIBLE_DEVICES only makes sense for CUDA GPUs; LigandMPNN's run.py auto-detects mps/cpu otherwise.
+        if self.lmpnn_inference_device.startswith('cuda'):
+            sample_command += f' CUDA_VISIBLE_DEVICES={self.lmpnn_inference_device.split(":")[-1]}'
         sample_command += f' {self.ligandmpnn_python} run.py --verbose 0 --model \'ligand_mpnn\' --pdb_path {backbone_path.absolute()} --out_folder {lmpnn_output_subdir.absolute()} --pack_side_chains 1 --number_of_packs_per_design 1 --pack_with_ligand_context 1'
         sample_command += f' --temperature {self.lmpnn_sequence_sample_temperature}'
         sample_command += f' --number_of_batches {self.lmpnn_number_of_batches}'
@@ -387,13 +392,22 @@ class DesignCampaign:
             wandb.log(logs)
     
 
+def _boltz_device_args(boltz_inference_devices):
+    """Builds the (env_var_prefix, cli_flags) pair for boltz's device selection. CUDA_VISIBLE_DEVICES / --devices N only makes sense for CUDA GPUs; Apple Silicon exposes a single 'mps' device."""
+    if all(d.startswith('cuda') for d in boltz_inference_devices):
+        device_ints = [d.split(':')[-1] for d in boltz_inference_devices]
+        return f'CUDA_VISIBLE_DEVICES={",".join(device_ints)} ', f'--devices {len(device_ints)} --accelerator gpu'
+    accelerator = 'mps' if boltz_inference_devices[0].startswith('mps') else 'cpu'
+    return '', f'--devices 1 --accelerator {accelerator}'
+
+
 def predict_complex_structures(
-    boltz_inputs_dir, boltz2x_executable_path, boltz_inference_devices, 
+    boltz_inputs_dir, boltz2x_executable_path, boltz_inference_devices,
     boltz_output_dir, use_potentials, use_boltz_1x, disable_kernels, disable_nccl_p2p, debug
 ):
-    device_ints = [x.split(':')[-1] for x in boltz_inference_devices]
-    command = f'{boltz2x_executable_path} predict {boltz_inputs_dir} --devices {len(device_ints)} --out_dir {boltz_output_dir} --output_format pdb --override'
-    command = f'CUDA_VISIBLE_DEVICES={",".join(device_ints)} {command}'
+    env_prefix, device_flags = _boltz_device_args(boltz_inference_devices)
+    command = f'{boltz2x_executable_path} predict {boltz_inputs_dir} {device_flags} --out_dir {boltz_output_dir} --output_format pdb --override'
+    command = f'{env_prefix}{command}'
 
     if disable_nccl_p2p:
         command = f'NCCL_P2P_DISABLE=1 {command}'
@@ -538,7 +552,7 @@ if __name__ == "__main__":
         sequences_sampled_at_once = 30,
 
         boltz2x_executable_path = str((Path(NISE_DIRECTORY_PATH) / '.venv/bin/boltz').absolute()),
-        boltz_inference_devices = (boltz_inference_devices := ['cuda:0', ]), # a list of multiple torch-style device strings
+        boltz_inference_devices = (boltz_inference_devices := ['mps']), # Apple Silicon exposes a single unified GPU device.
         use_boltz_conformer_potentials = True, # Use Boltz-x mode, this is almost always better.
         boltz2_predict_affinity = True if ('pbind' in objective_function) else False,
         use_boltz_1x = False, # Run the same script using --model boltz-1, multi-device inference with this seems bugged with boltz v2.1.1
@@ -548,7 +562,7 @@ if __name__ == "__main__":
         # sequences_sampled_per_backbone = 64 if not debug else 1 * len(boltz_inference_devices),
         burial_mask_alpha_hull_alpha = 9.0, # Set to a larger number for folds with wider pockets (ex: 7-helix bundle) (Ex: 100.0), see https://github.com/benf549/CARPdock/blob/main/visualize_hull.ipynb
 
-        ligandmpnn_python = '/nfs/polizzi/bfry/programs/miniconda3/envs/ligandmpnn_env/bin/python3.11',
+        ligandmpnn_python = '/Users/florian/miniconda3/envs/LigandMPNN/bin/python3.11',
         lmpnn_sequence_sample_temperature = 0.5,
         lmpnn_number_of_batches = 8 if not debug else 1,
         lmpnn_batch_size = 8,
